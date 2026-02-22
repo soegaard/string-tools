@@ -65,8 +65,9 @@ div.Cgroup > table {
     border-radius: 8px;
     border-collapse: separate;
     border-spacing: 0;
-    width: max-content;
-    min-width: 100%;
+    width: 100%;
+    min-width: 0;
+    table-layout: fixed;
     font-size: 95%;
 }
 
@@ -77,8 +78,11 @@ div.Cgroup > table td {
 }
 
 div.Cgroup > table td:first-child {
-    width: 6.75em;
+    width: 9em;
     white-space: normal;
+    overflow-wrap: normal;
+    word-break: normal;
+    hyphens: auto;
     line-height: 1.15;
     background: var(--label-bg);
     color: #1f1f19;
@@ -87,7 +91,10 @@ div.Cgroup > table td:first-child {
 
 div.Cgroup > table td:nth-child(2) {
     width: 100%;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    line-height: 1.35;
 }
 
 div.Cgroup > table td:nth-child(2) a {
@@ -96,10 +103,20 @@ div.Cgroup > table td:nth-child(2) a {
     font-size: 0.93rem;
     text-decoration-thickness: 1px;
     text-underline-offset: 0.12em;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
     display: block;
     line-height: 1.35;
     transition: color 120ms ease-in-out;
+}
+
+div.Cgroup > table td:nth-child(2) .RktValLink,
+div.Cgroup > table td:nth-child(2) .RktSym,
+div.Cgroup > table td:nth-child(2) .RktValDef {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    display: block;
+    line-height: 1.35;
 }
 
 div.Cgroup > table td:nth-child(2) a:hover {
