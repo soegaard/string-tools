@@ -2,29 +2,50 @@
 
 @;{
 Build docs with:
-  raco scribble --html +m --redirect-main https://docs.racket-lang.org/ string-tools.scrbl
+  raco scribble --html +m --dest html --redirect-main https://docs.racket-lang.org/ string-tools.scrbl
 }
 
 @(require scribble/example
           (only-in scribble/eval make-base-eval)
           "racket-cheat.rkt"
           (for-label racket/base
-                     string-tools/char-set
-                     string-tools/string-tools))
+                     string-tools/char-set))
 
 @(define st-eval (make-base-eval))
-@(st-eval '(require string-tools/string-tools))
+@(st-eval '(require string-tools))
 
 @title{String Tools}
 @author+email["Jens Axel Søgaard" "jensaxel@soegaard.net"]
 
-@defmodule[string-tools/string-tools]
+@defmodule[string-tools]
 
 @section{String Functions}
 
 This section documents string-processing procedures provided by this package.
 They focus on practical operations such as splitting, substring counting, and
 character counting with explicit index bounds.
+
+The procedures are intended to complement @racketmodname[racket/string], so a
+typical setup is:
+
+@nested[#:style 'inset]{@racketblock[
+  (require racket/string string-tools)
+]}
+
+Procedures that are close in purpose to existing Racket procedures use distinct
+names (for example, @racket[string-at] instead of @racket[string-ref]) to avoid
+name clashes. Some procedure names follow the SRFI 13 naming tradition. If you
+need both libraries at once, prefix SRFI 13, for example:
+
+@nested[#:style 'inset]{@racketblock[
+  (require (prefix-in srfi: srfi/13) string-tools)
+]}
+
+Before diving into the individual procedures, consider skimming
+@secref["Extended_Examples"].
+It includes one example on parsing and analyzing structured log lines, one
+example on cleaning and validating CSV-like imported rows, and one example on
+normalizing and patching an INI-like configuration text.
 
 @subsection{Conventions}
 
@@ -88,7 +109,7 @@ Use this overview as a quick map from task to procedure family.
          @elem{@racket[string-index] @racket[string-index-right]
                @racket[string-skip] @racket[string-skip-right]})
    (CRow "Trimming"
-         @elem{@racket[string-trim-left] @racket[string-trim-right]})))
+         @elem{@racket[string-trim-both] @racket[string-trim-left] @racket[string-trim-right]})))
 
 @(CSection
   #:which 'left
@@ -597,6 +618,36 @@ If @racket[to-trim] is a string, it is converted to a character set.
   (string-trim-right "5x321" char-numeric?)
   (string-trim-right "xxabcxx" #\x 1 6)
   (string-trim-right "xxabcxx" #\x -5 -1)
+]
+}
+
+@margin-note{ℹ️ Similar to @racket[string-trim], but this procedure uses the
+matcher conventions in this module for @racket[to-trim].}
+@defproc[(string-trim-both
+           [s string?]
+           [to-trim (or/c char? char-set? string? (-> char? any/c)) char-whitespace?]
+           [start exact-integer? 0]
+           [end exact-integer? (string-length s)])
+         string?]{
+
+Returns a copy of the substring from @racket[start] to @racket[end]
+(@racket[end] not included), after removing matching characters from both the
+left and right sides.
+
+Indices may be negative and are clamped to the string bounds.
+
+If @racket[to-trim] is omitted, whitespace is trimmed.
+If @racket[to-trim] is a string, it is converted to a character set.
+
+@examples[
+  #:eval st-eval
+  (string-trim-both "   abc  ")
+  (string-trim-both "aaabaa" #\a)
+  (string-trim-both "aaabaa" "a")
+  (string-trim-both "abbaXYZabba" "ab")
+  (string-trim-both "123x5" char-numeric?)
+  (string-trim-both "xxabcxx" #\x 1 6)
+  (string-trim-both "xxabcxx" #\x -5 -1)
 ]
 }
 
@@ -1838,4 +1889,312 @@ Returns the number of characters in @racket[cs].
   (char-set-size vowels)
   (define letters (char-set-add-range empty-char-set #\a #\z))
   (char-set-size (char-set-difference letters vowels))
+]
+
+@section{Extended Examples}
+
+This section presents three end-to-end workflows: log analysis, CSV-like
+import cleaning, and configuration normalization with patching.
+
+@subsection{Logs}
+
+This extended example uses a small synthetic log and shows a full
+normalize-parse-analyze pipeline.
+Each log line uses the format:
+
+@nested[#:style 'inset]{@tt{ts level service=... request_id=... msg="..."}}
+
+Here, @tt{ts} is the time stamp.
+
+Prepare a small synthetic log input.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define raw-log
+    (string-append
+     "2026-02-21T22:10:00Z INFO service=api request_id=abc123 msg=\"start\"\r\n"
+     "\u001b[31m2026-02-21T22:10:01Z ERROR service=api request_id=abc123 msg=\"timeout\"\u001b[0m\r\n"
+     "2026-02-21T22:10:02Z WARN service=worker request_id=def456 msg=\"retrying\"\n"
+     "2026-02-21T22:10:03Z INFO service=api request_id=abc123 msg=\"done\"\r"))
+]
+
+Normalize line endings and remove ANSI terminal escapes.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define cleaned-log
+    (string-strip-ansi (string-normalize-newlines raw-log)))
+]
+
+Turn text into non-empty log lines and inspect quick counts.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define lines
+    (filter (λ (s) (not (string-blank? s)))
+            (string-lines cleaned-log)))
+
+  (length lines)
+  (string-count-needle cleaned-log "ERROR")
+]
+
+Define a parser that turns one line into a record.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define (line->record line)
+    (define fs         (string-fields line #\space))
+    (define ts         (list-ref fs 0))
+    (define level      (list-ref fs 1))
+    (define service    (string-between line "service=" " "))
+    (define request-id (string-between line "request_id=" " "))
+    (define msg        (string-between line "msg=\"" "\"" #:right-match 'last))
+    (list ts level service request-id msg))
+]
+
+Parse all lines and inspect the first parsed record.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define records (map line->record lines))
+  (car records)
+]
+
+Select all ERROR records.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define error-records
+    (filter (λ (r) (string=? (list-ref r 1) "ERROR")) records))
+
+  error-records
+]
+
+@subsection{CSV-Like Import Cleaning}
+
+This example shows a small CSV-like import pipeline with quoted fields,
+whitespace cleanup, and row-level validation diagnostics.
+
+Prepare a small CSV-like input and split it into rows.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define raw-csv
+    (string-append
+     "id,name,socre\r\n"
+     "1,\"Alice\",98\r\n"
+     "2,\" Bob  \",87\r\n"
+     "x,\"Mallory\",91\r\n"
+     "4,\"Eve\",9a\r\n"
+     "5,\"\",100\r\n"))
+
+  (define rows
+    (string-lines (string-normalize-newlines raw-csv)))
+]
+
+Parse header and data rows.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define header (string-fields (car rows) #\, #:quote #\"))
+  (define data-rows (cdr rows))
+]
+
+Validate header names and suggest likely intended names.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define expected-header '("id" "name" "score"))
+
+  (define (best-column-suggestion col)
+    (define-values (best-name best-score)
+      (for/fold ([best-name #f] [best-score -1.0]) ([cand (in-list expected-header)])
+        (define score (string-similarity col cand))
+        (if (> score best-score)
+            (values cand score)
+            (values best-name best-score))))
+    (if (and best-name (>= best-score 0.70))
+        best-name
+        #f))
+
+  (define header-diagnostics
+    (for/list ([col (in-list header)] #:unless (member col expected-header))
+      (define suggestion (best-column-suggestion col))
+      (if suggestion
+          (string-append "unknown column " col "; did you mean " suggestion "?")
+          (string-append "unknown column " col))))
+  header-diagnostics
+]
+
+Define a small field normalizer used during import.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define (clean-field s)
+    (string-trim-both (string-squeeze s #\space) #\space))
+]
+
+Parse each row as CSV-like fields and inspect parsed rows.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define parsed
+    (for/list ([row (in-list data-rows)])
+      (for/list ([field (in-list (string-fields row #\, #:quote #\"))])
+        (clean-field field))))
+  parsed
+]
+
+Validate rows: id and score must be digits; name must be non-blank.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define (row-error fs)
+    (define id    (list-ref fs 0))
+    (define name  (list-ref fs 1))
+    (define score (list-ref fs 2))
+    (cond
+      [(not (string-digit? id))    "invalid id"]
+      [(string-blank? name)        "blank name"]
+      [(not (string-digit? score)) "invalid score"]
+      [else #f]))
+]
+
+Keep diagnostics for rows that fail validation.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define diagnostics
+    (for/list ([row (in-list data-rows)]
+               [fs  (in-list parsed)]
+               #:when (row-error fs))
+      (list (row-error fs)
+            (string-escape-visible row))))
+
+  header
+  diagnostics
+]
+
+@subsection{Config Normalization and Patching}
+
+This example parses an INI-like configuration text, validates keys, suggests
+fixes for unknown keys, patches one value in-place, and emits normalized
+output with a final newline.
+
+Prepare and normalize a small INI-like input.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define raw-config
+    (string-append
+     "; demo config\r\n"
+     "host = example.org\r\n"
+     "port = 8080\r\n"
+     "timeout = 30\r\n"
+     "retris = 2\r\n"
+     "mode fast\r\n"))
+  (define normalized (string-normalize-newlines raw-config))
+  (define lines      (string-lines normalized))
+  (define expected-keys '("host" "port" "timeout" "retries" "mode"))
+]
+
+Define helpers for comment detection and line parsing.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define (comment-line? t)
+    (memv (string-at t 0 #f) '(#\# #\;)))
+
+  (define (parse-config-line line)
+    (define t (string-trim-both line))
+    (cond
+      [(string-blank? t)
+       #f]
+      [(comment-line? t)
+       #f]
+      [else
+       (define-values (lhs sep rhs) (string-partition t "="))
+       (if (string=? sep "")
+           (list 'invalid (string-escape-visible line))
+           (list (string-trim-both lhs)
+                 (string-trim-both rhs)))]))
+]
+
+Parse all lines and inspect the intermediate representation.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define parsed-lines
+    (filter (λ (x) x)
+            (map parse-config-line lines)))
+  parsed-lines
+]
+
+Validate keys and produce diagnostics with similarity-based suggestions.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define (best-key-suggestion k)
+    (define-values (best-name best-score)
+      (for/fold ([best-name #f] [best-score -1.0]) ([cand (in-list expected-keys)])
+        (define score (string-similarity k cand))
+        (if (> score best-score)
+            (values cand score)
+            (values best-name best-score))))
+    (if (and best-name (>= best-score 0.70))
+        best-name
+        #f))
+
+  (define diagnostics
+    (for/list ([entry (in-list parsed-lines)]
+               #:when
+               (or (eq? (car entry) 'invalid)
+                   (and (string? (car entry))
+                        (not (member (car entry) expected-keys)))))
+      (cond
+        [(eq? (car entry) 'invalid)
+         (string-append "malformed line: " (cadr entry))]
+        [else
+         (define key (car entry))
+         (define sug (best-key-suggestion key))
+         (if sug
+             (string-append "unknown key " key "; did you mean " sug "?")
+             (string-append "unknown key " key))])))
+  diagnostics
+]
+
+Patch one setting in-place and normalize final output.
+
+@examples[
+  #:label #f
+  #:eval st-eval
+  (define old-timeout "timeout = 30")
+  (define i           (string-find-needle normalized old-timeout))
+  (define patched
+    (if i
+        (string-replace-range normalized
+                              i
+                              (+ i (string-length old-timeout))
+                              "timeout = 45")
+        normalized))
+  (define final-config
+    (string-ensure-ends-with-newline patched))
+  (displayln final-config)
 ]
