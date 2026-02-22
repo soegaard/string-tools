@@ -1,6 +1,7 @@
 .DS_Store
 compiled/
 /doc/
+html/
 *~
 *.bak
 \#*
