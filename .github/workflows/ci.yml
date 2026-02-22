@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Racket
+        uses: Bogdanp/setup-racket@v1.11
+        with:
+          architecture: x64
+          distribution: full
+          version: stable
+
+      - name: Show Racket version
+        run: racket --version
+
+      - name: Install local packages (smoke test)
+        run: |
+          raco pkg install --auto --batch --name string-tools-lib pkgs/string-tools-lib
+          raco pkg install --auto --batch --name string-tools pkgs/string-tools
+
+      - name: Require smoke test
+        run: |
+          racket -e '(require string-tools) (displayln "require string-tools: ok")'
+          racket -e '(require string-tools/char-set) (displayln "require string-tools/char-set: ok")'
+
+      - name: Run library tests
+        run: raco test pkgs/string-tools-lib/string-tools.rkt
+
+      - name: Build docs
+        run: |
+          raco scribble --html +m --dest html --redirect-main https://docs.racket-lang.org/ pkgs/string-tools/string-tools.scrbl
