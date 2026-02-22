@@ -32,6 +32,10 @@ Example:
 - Use module-aware rendering for links:
   - `raco scribble --html +m --dest html --redirect-main https://docs.racket-lang.org/ string-tools.scrbl`
 - If build instructions are kept inside `.scrbl`, use non-rendered Scribble comments (`@;{ ... }`).
+- Keep the normal `@examples` label (`Examples:`) for regular function entries.
+- Use `#:label #f` only when a longer worked example is intentionally split into staged subsections.
+- For long worked examples, split into smaller blocks and add a one-line lead-in sentence before each block.
+- Do not leave unresolved Scribble warnings (especially undefined tags/cross references) after doc edits unless explicitly accepted by the user; treat them as regressions to fix.
 
 ## Testing And Validation
 After edits, run the most relevant checks:
@@ -40,3 +44,7 @@ After edits, run the most relevant checks:
 - For docs: `raco scribble --html +m --dest html --redirect-main https://docs.racket-lang.org/ <file>.scrbl`
 
 When failures exist that predate the current change, report them clearly as pre-existing.
+
+## Changelog
+- Keep `/Users/soegaard/Dropbox/GitHub/string-tools/CHANGELOG.md` updated for user-visible changes.
+- For release-worthy updates, add entries under `Added`, `Changed`, and `Fixed` as appropriate.

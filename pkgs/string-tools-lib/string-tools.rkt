@@ -66,6 +66,7 @@
          string-ensure-prefix
          string-ensure-suffix
          string-trim-left
+         string-trim-both
          string-trim-right
          string-index
          string-index-right
@@ -731,7 +732,13 @@
   (define default-end   (if step-pos? n -1))
   (define start-raw (if (not start) default-start start))
   (define end-raw   (if (not end) default-end end))
-  (define start* (normalize-bound n start-raw))
+  (define start*
+    (if step-pos?
+        (normalize-bound n start-raw)
+        (if (zero? n)
+            -1
+            (let ([s0 (if (negative? start-raw) (+ n start-raw) start-raw)])
+              (min (sub1 n) (max -1 s0))))))
   (define end*
     (if step-pos?
         (normalize-bound n end-raw)
@@ -2047,6 +2054,36 @@
       (substring s start* (add1 i))
       ""))
 
+;; string-trim-both : string?
+;;                    [(or/c char? char-set? string? (-> char? any/c))]
+;;                    [exact-integer?] [exact-integer?]
+;;                    -> string?
+;;   Trim matching characters from both sides of the selected substring.
+(define (string-trim-both s . args)
+  (define n (string-length s))
+  (define-values (raw-needle start end)
+    (case (length args)
+      [(0) (values char-whitespace? 0 n)]
+      [(1) (values (list-ref args 0) 0 n)]
+      [(2) (values (list-ref args 0) (list-ref args 1) n)]
+      [(3) (values (list-ref args 0) (list-ref args 1) (list-ref args 2))]
+      [else
+       (raise-arity-error 'string-trim-both "(string? [matcher] [start] [end])"
+                          (cons s args))]))
+  (define needle
+    (if (string? raw-needle)
+        (string->char-set raw-needle)
+        raw-needle))
+  (define-values (start* end*) (normalize-start/end 'string-trim-both n start end))
+
+  (define i (string-skip s needle start* end*))
+  (if i
+      (let ([j (string-skip-right s needle i end*)])
+        (if j
+            (substring s i (add1 j))
+            ""))
+      ""))
+
 (module+ test
   (require rackunit
            "char-set.rkt")
@@ -2314,6 +2351,267 @@
   (check-equal? (string-at "" 0 #\x) #\x)
   (check-exn exn:fail:contract? (λ () (string-at 123 0)))
   (check-exn exn:fail:contract? (λ () (string-at "abc" 1.5)))
+
+  ;; property-style tests: index normalization and bounds behavior
+  (random-seed 20260222)
+
+  (define alphabet "abcXYZ09 _-")
+
+  (define (random-char)
+    (string-ref alphabet (random (string-length alphabet))))
+
+  (define (random-string [max-len 24])
+    (define len (random (add1 max-len)))
+    (list->string
+     (for/list ([k (in-range len)])
+       (random-char))))
+
+  (define (expected-string-at s i default)
+    (define n (string-length s))
+    (cond
+      [(zero? n)
+       default]
+      [else
+       (define i0 (if (negative? i) (+ n i) i))
+       (define i* (min (sub1 n) (max 0 i0)))
+       (string-ref s i*)]))
+
+  (define (expected-index s ch start* end*)
+    (let loop ([i start*])
+      (cond
+        [(>= i end*) #f]
+        [(char=? (string-ref s i) ch) i]
+        [else (loop (add1 i))])))
+
+  (define (expected-index-right s ch start* end*)
+    (let loop ([i (sub1 end*)])
+      (cond
+        [(< i start*) #f]
+        [(char=? (string-ref s i) ch) i]
+        [else (loop (sub1 i))])))
+
+  (define (expected-skip s ch start* end*)
+    (let loop ([i start*])
+      (cond
+        [(>= i end*) #f]
+        [(not (char=? (string-ref s i) ch)) i]
+        [else (loop (add1 i))])))
+
+  (define (expected-skip-right s ch start* end*)
+    (let loop ([i (sub1 end*)])
+      (cond
+        [(< i start*) #f]
+        [(not (char=? (string-ref s i) ch)) i]
+        [else (loop (sub1 i))])))
+
+  (define (expected-slice/step s start end step)
+    (define n            (string-length s))
+    (define step-pos?    (positive? step))
+    (define default-start (if step-pos? 0 (sub1 n)))
+    (define default-end   (if step-pos? n -1))
+    (define start-raw     (if (not start) default-start start))
+    (define end-raw       (if (not end) default-end end))
+    (define start*
+      (if step-pos?
+          (normalize-bound n start-raw)
+          (if (zero? n)
+              -1
+              (let ([s0 (if (negative? start-raw) (+ n start-raw) start-raw)])
+                (min (sub1 n) (max -1 s0))))))
+    (define end*
+      (if step-pos?
+          (normalize-bound n end-raw)
+          (if (not end)
+              -1
+              (let ([e0 (if (negative? end-raw) (+ n end-raw) end-raw)])
+                (min n (max -1 e0))))))
+    (list->string
+     (for/list ([idx (in-range start* end* step)])
+       (string-ref s idx))))
+
+  (define (expected-find-all-needle s needle start end overlap? ranges?)
+    (define n (string-length s))
+    (define m (string-length needle))
+    (define-values (start* end*) (normalize-start/end 'test n start end))
+    (define (emit i)
+      (if ranges?
+          (cons i (+ i m))
+          i))
+    (cond
+      [(> start* end*)
+       '()]
+      [(zero? m)
+       (for/list ([i (in-range start* (add1 end*))])
+         (if ranges?
+             (cons i i)
+             i))]
+      [else
+       (let loop ([i start*] [acc '()])
+         (define j (string-find-needle s needle i end*))
+         (if j
+             (loop (+ j (if overlap? 1 m))
+                   (cons (emit j) acc))
+             (reverse acc)))]))
+
+  (for ([trial (in-range 500)])
+    (define s      (random-string))
+    (define n      (string-length s))
+    (define start  (- (random 80) 40))
+    (define end    (- (random 80) 40))
+    (define i      (- (random 120) 60))
+    (define ch     (random-char))
+    (define start* (normalize-bound n start))
+    (define end*   (normalize-bound n end))
+
+    ;; normalize-bound always clamps into [0, n]
+    (check-true (<= 0 start* n))
+    (check-true (<= 0 end* n))
+
+    ;; string-slice agrees with clamped substring semantics
+    (define expected-slice
+      (if (<= end* start*)
+          ""
+          (substring s start* end*)))
+    (check-equal? (string-slice s start end) expected-slice)
+
+    ;; string-at is coherent with clamped indexing and default on empty string
+    (check-equal? (string-at s i 'default)
+                  (expected-string-at s i 'default))
+
+    ;; index/skip procedures stay within normalized bounds and match spec
+    (check-equal? (string-index s ch start end)
+                  (expected-index s ch start* end*))
+    (check-equal? (string-index-right s ch start end)
+                  (expected-index-right s ch start* end*))
+    (check-equal? (string-skip s ch start end)
+                  (expected-skip s ch start* end*))
+    (check-equal? (string-skip-right s ch start end)
+                  (expected-skip-right s ch start* end*)))
+
+  ;; property-style tests: string-slice/step semantics
+  (for ([trial (in-range 500)])
+    (define s      (random-string))
+    (define n      (string-length s))
+    (define start  (if (zero? (random 4)) #f (- (random 80) 40)))
+    (define end    (if (zero? (random 4)) #f (- (random 80) 40)))
+    (define step0  (- (random 15) 7))
+    (define step   (if (zero? step0) 1 step0))
+    (define starti (- (random 80) 40))
+    (define endi   (- (random 80) 40))
+
+    (check-equal? (string-slice/step s start end step)
+                  (expected-slice/step s start end step))
+    (check-equal? (string-slice/step s starti endi 1)
+                  (string-slice s starti endi)))
+
+  ;; property-style tests: string-find-all-needle invariants
+  (for ([trial (in-range 400)])
+    (define s        (random-string))
+    (define needle   (random-string 4))
+    (define n        (string-length s))
+    (define m        (string-length needle))
+    (define start    (- (random 80) 40))
+    (define end      (- (random 80) 40))
+    (define-values (start* end*) (normalize-start/end 'test n start end))
+    (define overlap? (zero? (random 2)))
+    (define ranges?  (zero? (random 2)))
+    (define got
+      (string-find-all-needle s needle start end
+                              #:overlap? overlap?
+                              #:ranges? ranges?))
+
+    (check-equal? got
+                  (expected-find-all-needle s needle start end overlap? ranges?))
+
+    (define starts
+      (if ranges?
+          (map car got)
+          got))
+    (define prev -inf.0)
+    (for ([idx (in-list starts)])
+      (check-true (<= start* idx end*))
+      (check-true (> idx prev))
+      (set! prev idx))
+
+    (when (and (not overlap?) (positive? m))
+      (when (pair? starts)
+        (for ([a (in-list starts)]
+              [b (in-list (cdr starts))])
+          (check-true (<= (+ a m) b)))))
+
+    (when ranges?
+      (for ([r (in-list got)])
+        (when (zero? m)
+          (check-equal? (car r) (cdr r)))
+        (when (positive? m)
+          (check-equal? (- (cdr r) (car r)) m)))))
+
+  ;; property-style tests: matcher-equivalence
+  (for ([trial (in-range 400)])
+    (define s      (random-string 30))
+    (define ch     (random-char))
+    (define start  (- (random 80) 40))
+    (define end    (- (random 80) 40))
+    (define as-char ch)
+    (define as-set  (make-char-set ch))
+    (define as-str  (string ch))
+    (define as-pred (λ (c) (char=? c ch)))
+
+    (check-equal? (string-count s as-char start end)
+                  (string-count s as-set  start end))
+    (check-equal? (string-count s as-char start end)
+                  (string-count s as-str  start end))
+    (check-equal? (string-count s as-char start end)
+                  (string-count s as-pred start end))
+
+    (check-equal? (string-index s as-char start end)
+                  (string-index s as-set  start end))
+    (check-equal? (string-index s as-char start end)
+                  (string-index s as-str  start end))
+    (check-equal? (string-index s as-char start end)
+                  (string-index s as-pred start end))
+
+    (check-equal? (string-index-right s as-char start end)
+                  (string-index-right s as-set  start end))
+    (check-equal? (string-index-right s as-char start end)
+                  (string-index-right s as-str  start end))
+    (check-equal? (string-index-right s as-char start end)
+                  (string-index-right s as-pred start end))
+
+    (check-equal? (string-skip s as-char start end)
+                  (string-skip s as-set  start end))
+    (check-equal? (string-skip s as-char start end)
+                  (string-skip s as-str  start end))
+    (check-equal? (string-skip s as-char start end)
+                  (string-skip s as-pred start end))
+
+    (check-equal? (string-skip-right s as-char start end)
+                  (string-skip-right s as-set  start end))
+    (check-equal? (string-skip-right s as-char start end)
+                  (string-skip-right s as-str  start end))
+    (check-equal? (string-skip-right s as-char start end)
+                  (string-skip-right s as-pred start end))
+
+    (check-equal? (string-trim-left s as-char start end)
+                  (string-trim-left s as-set  start end))
+    (check-equal? (string-trim-left s as-char start end)
+                  (string-trim-left s as-str  start end))
+    (check-equal? (string-trim-left s as-char start end)
+                  (string-trim-left s as-pred start end))
+
+    (check-equal? (string-trim-right s as-char start end)
+                  (string-trim-right s as-set  start end))
+    (check-equal? (string-trim-right s as-char start end)
+                  (string-trim-right s as-str  start end))
+    (check-equal? (string-trim-right s as-char start end)
+                  (string-trim-right s as-pred start end))
+
+    (check-equal? (string-trim-both s as-char start end)
+                  (string-trim-both s as-set  start end))
+    (check-equal? (string-trim-both s as-char start end)
+                  (string-trim-both s as-str  start end))
+    (check-equal? (string-trim-both s as-char start end)
+                  (string-trim-both s as-pred start end)))
 
   ;; string-lines
   (check-equal? (string-lines "") '())
@@ -2720,11 +3018,22 @@
   (check-equal? (string-trim-right "xxabcxx" #\x 1 6) "xabc")
   (check-equal? (string-trim-right "xxabcxx" #\x -5 -1) "abc")
 
+  ;; string-trim-both
+  (check-equal? (string-trim-both "   abc  ") "abc")
+  (check-equal? (string-trim-both "aaabaa" #\a) "b")
+  (check-equal? (string-trim-both "aaabaa" "a") "b")
+  (check-equal? (string-trim-both "123x5" char-numeric?) "x")
+  (check-equal? (string-trim-both "abba" (make-char-set #\a #\b)) "")
+  (check-equal? (string-trim-both "xxabcxx" #\x 1 6) "abc")
+  (check-equal? (string-trim-both "xxabcxx" #\x -5 -1) "abc")
+
   ;; trim errors
   (check-exn exn:fail:contract? (λ () (string-trim-left 123)))
   (check-equal? (string-trim-left "abc" #\a -1 2) "")
   (check-exn exn:fail:contract? (λ () (string-trim-right "abc" (λ (x y) x))))
   (check-equal? (string-trim-right "abc" #\a 2 1) "")
+  (check-exn exn:fail:contract? (λ () (string-trim-both "abc" (λ (x y) x))))
+  (check-equal? (string-trim-both "abc" #\a 2 1) "")
 
   ;; index/skip errors
   (check-exn exn:fail:contract? (λ () (string-index 123 #\a)))
