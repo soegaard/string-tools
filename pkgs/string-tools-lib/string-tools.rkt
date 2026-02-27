@@ -2,6 +2,7 @@
 
 (require racket/list
          racket/generator
+         racket/port
          racket/string
          "char-set.rkt")
 
@@ -15,6 +16,10 @@
          string-partition-right
          string-replace-range
          string-repeat
+         string-template
+         string-template?
+         make-string-template
+         string-template-apply
          string-reverse
          string-levenshtein
          string-jaro-winkler
@@ -313,6 +318,418 @@
       [(zero? k) acc]
       [(odd? k)  (loop (quotient k 2) (string-append chunk chunk) (string-append acc chunk))]
       [else      (loop (quotient k 2) (string-append chunk chunk) acc)])))
+
+;; template-auto : -> template-auto?
+;;   Marker for an automatic positional placeholder (``).
+(struct template-auto () #:transparent)
+
+;; template-pos : exact-nonnegative-integer? -> template-pos?
+;;   Marker for an explicit positional placeholder (`n`).
+(struct template-pos (index) #:transparent)
+
+;; template-name : string? -> template-name?
+;;   Marker for a named placeholder (`name`).
+(struct template-name (name) #:transparent)
+
+;; template-expr : string? -> template-expr?
+;;   Marker for an expression placeholder (<* expr *>).
+(struct template-expr (source) #:transparent)
+
+;; template-association-list? : any/c -> boolean?
+;;   Check whether v is an association list.
+(define (template-association-list? v)
+  (and (list? v)
+       (andmap pair? v)))
+
+;; template-placeholder-name? : string? -> boolean?
+;;   Check whether s is a valid placeholder name.
+(define (template-placeholder-name? s)
+  (regexp-match? #px"^[A-Za-z_][A-Za-z0-9_]*$" s))
+
+;; parse-template-placeholder : string? symbol?
+;;                              -> (or/c template-auto? template-pos? template-name?)
+;;   Parse one placeholder body from between backticks.
+(define (parse-template-placeholder body who)
+  (cond
+    [(string=? body "")
+     (template-auto)]
+    [(regexp-match? #px"^[0-9]+$" body)
+     (define n (string->number body))
+     (if (and (exact-integer? n) (exact-nonnegative-integer? n))
+         (template-pos n)
+         (raise-arguments-error who
+                                "positional placeholder must be a nonnegative integer"
+                                "placeholder" (string-append "`" body "`")))]
+    [(template-placeholder-name? body)
+     (template-name body)]
+    [else
+     (raise-arguments-error who
+                            "invalid placeholder syntax"
+                            "placeholder" (string-append "`" body "`"))]))
+
+;; parse-string-template : string? symbol?
+;;                         -> (listof (or/c string? template-auto? template-pos?
+;;                                          template-name? template-expr?))
+;;   Parse template text into literal text pieces and placeholder markers.
+(define (parse-string-template tmpl who)
+  (define n (string-length tmpl))
+  (define (flush-text! text-rev tokens)
+    (define piece (list->string (reverse text-rev)))
+    (if (string=? piece "")
+        tokens
+        (cons piece tokens)))
+  (let loop ([i 0] [tokens '()] [text-rev '()])
+    (cond
+      [(>= i n)
+       (reverse (flush-text! text-rev tokens))]
+      [else
+       (define ch (string-ref tmpl i))
+       (cond
+         [(and (char=? ch #\\)
+               (< (add1 i) n)
+               (char=? (string-ref tmpl (add1 i)) #\`))
+          (loop (+ i 2) tokens (cons #\` text-rev))]
+         [(char=? ch #\`)
+          (define close
+            (let find-close ([j (add1 i)])
+              (cond
+                [(>= j n) #f]
+                [(char=? (string-ref tmpl j) #\`) j]
+                [else (find-close (add1 j))])))
+          (unless close
+            (raise-arguments-error who
+                                   "unterminated placeholder"
+                                   "template" tmpl
+                                   "index" i))
+          (define next-tokens (flush-text! text-rev tokens))
+          (define body (substring tmpl (add1 i) close))
+          (define marker (parse-template-placeholder body who))
+          (loop (add1 close)
+                (cons marker next-tokens)
+                '())]
+         [(and (char=? ch #\<)
+               (< (add1 i) n)
+               (char=? (string-ref tmpl (add1 i)) #\*))
+          (define close
+            (let find-close ([j (+ i 2)])
+              (cond
+                [(>= j n) #f]
+                [(and (< (add1 j) n)
+                      (char=? (string-ref tmpl j) #\*)
+                      (char=? (string-ref tmpl (add1 j)) #\>))
+                 j]
+                [else
+                 (find-close (add1 j))])))
+          (unless close
+            (raise-arguments-error who
+                                   "unterminated expression placeholder"
+                                   "template" tmpl
+                                   "index" i))
+          (define next-tokens (flush-text! text-rev tokens))
+          (define body
+            (string-trim (substring tmpl (+ i 2) close)))
+          (when (string=? body "")
+            (raise-arguments-error who
+                                   "empty expression placeholder"
+                                   "template" tmpl
+                                   "index" i))
+          (loop (+ close 2)
+                (cons (template-expr body) next-tokens)
+                '())]
+         [else
+          (loop (add1 i) tokens (cons ch text-rev))])])))
+
+;; template-expression-bindings : any/c -> (listof (cons/c symbol? any/c))
+;;   Extract symbol bindings from hash/alist containers for expression evaluation.
+(define (template-expression-bindings bindings)
+  (define (key->symbol k)
+    (cond
+      [(symbol? k)
+       k]
+      [(string? k)
+       (string->symbol k)]
+      [else
+       #f]))
+  (cond
+    [(hash? bindings)
+     (for/fold ([acc '()]) ([(k v) (in-hash bindings)])
+       (define sym (key->symbol k))
+       (if sym
+           (cons (cons sym v) acc)
+           acc))]
+    [(template-association-list? bindings)
+     (for/fold ([acc '()]) ([a (in-list bindings)])
+       (define sym (key->symbol (car a)))
+       (if sym
+           (cons (cons sym (cdr a)) acc)
+           acc))]
+    [else
+     '()]))
+
+;; template-eval-expression : symbol? string? any/c namespace? -> any/c
+;;   Evaluate expr using read-syntax/eval-syntax with named bindings in scope.
+(define (template-eval-expression who expr bindings expr-namespace)
+  (parameterize ([current-namespace expr-namespace])
+    (for ([a (in-list (template-expression-bindings bindings))])
+      (namespace-set-variable-value! (car a) (cdr a) #t))
+    (define stx
+      (call-with-input-string expr
+        (λ (in)
+          (define first (read-syntax who in))
+          (when (eof-object? first)
+            (raise-arguments-error who
+                                   "empty expression placeholder"
+                                   "expression" expr))
+          (define second (read-syntax who in))
+          (unless (eof-object? second)
+            (raise-arguments-error who
+                                   "expression placeholder must contain exactly one expression"
+                                   "expression" expr))
+          first)))
+    (eval-syntax (namespace-syntax-introduce stx))))
+
+;; template-ref-positional : any/c exact-nonnegative-integer? -> (values boolean? any/c)
+;;   Resolve 0-based positional index i from bindings.
+(define (template-ref-positional bindings i)
+  (cond
+    [(template-association-list? bindings)
+     (define found (assoc i bindings))
+     (if found
+         (values #t (cdr found))
+         (values #f #f))]
+    [(list? bindings)
+     (if (< i (length bindings))
+         (values #t (list-ref bindings i))
+         (values #f #f))]
+    [(vector? bindings)
+     (if (< i (vector-length bindings))
+         (values #t (vector-ref bindings i))
+         (values #f #f))]
+    [(hash? bindings)
+     (if (hash-has-key? bindings i)
+         (values #t (hash-ref bindings i))
+         (values #f #f))]
+    [else
+     (values #f #f)]))
+
+;; template-ref-named : any/c string? -> (values boolean? any/c)
+;;   Resolve named key from bindings by trying string and symbol keys.
+(define (template-ref-named bindings name)
+  (define sym (string->symbol name))
+  (cond
+    [(hash? bindings)
+     (cond
+       [(hash-has-key? bindings name) (values #t (hash-ref bindings name))]
+       [(hash-has-key? bindings sym)  (values #t (hash-ref bindings sym))]
+       [else                          (values #f #f)])]
+    [(template-association-list? bindings)
+     (define found
+       (let loop ([xs bindings])
+         (cond
+           [(null? xs) #f]
+           [else
+            (define a (car xs))
+            (define k (car a))
+            (cond
+              [(equal? k name) a]
+              [(equal? k sym)  a]
+              [else            (loop (cdr xs))])])))
+     (if found
+         (values #t (cdr found))
+         (values #f #f))]
+    [else
+     (values #f #f)]))
+
+;; template-container? : any/c -> boolean?
+;;   Check whether bindings is a supported container for string-template.
+(define (template-container? bindings)
+  (or (list? bindings)
+      (vector? bindings)
+      (hash? bindings)
+      (template-association-list? bindings)))
+
+;; template-missing-value : symbol? any/c string? -> any/c
+;;   Handle a missing placeholder according to on-missing.
+(define (template-missing-value who on-missing placeholder)
+  (cond
+    [(eq? on-missing 'error)
+     (raise-arguments-error who
+                            "missing template value"
+                            "placeholder" placeholder)]
+    [(eq? on-missing 'empty)
+     ""]
+    [else
+     (on-missing placeholder)]))
+
+;; render-string-template : symbol?
+;;                          (listof (or/c string? template-auto? template-pos?
+;;                                           template-name? template-expr?))
+;;                          any/c
+;;                          (-> any/c any/c)
+;;                          any/c
+;;                          namespace?
+;;                          (-> any/c ... any/c)
+;;                          -> any/c
+;;   Render parsed template tokens using bindings and return combiner output.
+(define (render-string-template who tokens bindings insertion on-missing expr-namespace combiner)
+  (define parts
+    (let loop ([xs tokens] [auto-index 0] [acc '()])
+      (cond
+        [(null? xs)
+         (reverse acc)]
+        [else
+         (define tok (car xs))
+         (cond
+           [(string? tok)
+            (loop (cdr xs) auto-index (cons tok acc))]
+           [(template-auto? tok)
+            (define-values (found? v)
+              (template-ref-positional bindings auto-index))
+            (define out-v
+              (if found?
+                  v
+                  (template-missing-value who on-missing "``")))
+            (loop (cdr xs) (add1 auto-index) (cons (insertion out-v) acc))]
+           [(template-pos? tok)
+            (define i (template-pos-index tok))
+            (define-values (found? v)
+              (template-ref-positional bindings i))
+           (define out-v
+              (if found?
+                  v
+                  (template-missing-value who on-missing (string-append "`" (number->string i) "`"))))
+            (loop (cdr xs) auto-index (cons (insertion out-v) acc))]
+           [(template-name? tok)
+            (define name (template-name-name tok))
+            (define-values (found? v)
+              (template-ref-named bindings name))
+            (define out-v
+              (if found?
+                  v
+                  (template-missing-value who on-missing (string-append "`" name "`"))))
+            (loop (cdr xs) auto-index (cons (insertion out-v) acc))]
+           [else
+            (define out-v
+              (template-eval-expression who
+                                        (template-expr-source tok)
+                                        bindings
+                                        expr-namespace))
+            (loop (cdr xs) auto-index (cons (insertion out-v) acc))])])))
+  (apply combiner parts))
+
+;; template : string?
+;;            (listof (or/c string? template-auto? template-pos?
+;;                             template-name? template-expr?))
+;;            (-> any/c any/c)
+;;            any/c
+;;            namespace?
+;;            (-> any/c ... any/c)
+;;            -> template?
+;;   Compiled string template with renderer options and procedure behavior.
+(struct template (source tokens insertion on-missing expression-namespace combiner)
+  #:property prop:custom-write
+  (λ (self out _mode)
+    (fprintf out "#<string-template ~s>" (template-source self)))
+  #:property prop:procedure
+  (λ (self . args)
+    (apply string-template-apply self args)))
+
+;; string-template? : any/c -> boolean?
+;;   Check whether v is a compiled string-template value.
+(define string-template? template?)
+
+;; make-string-template : string?
+;;                        [#:insertion (-> any/c any/c)]
+;;                        [#:missing (or/c 'error 'empty (-> string? any/c))]
+;;                        [#:expression-namespace (or/c #f namespace?)]
+;;                        [#:combiner (-> any/c ... any/c)]
+;;                        -> string-template?
+;;   Compile tmpl into a reusable template value.
+(define (make-string-template tmpl
+                              #:insertion [insertion (λ (v) (format "~a" v))]
+                              #:missing [on-missing 'error]
+                              #:expression-namespace [expression-namespace #f]
+                              #:combiner [combiner string-append])
+  (unless (string? tmpl)
+    (raise-argument-error 'make-string-template "string?" tmpl))
+  (unless (and (procedure? insertion)
+               (procedure-arity-includes? insertion 1))
+    (raise-argument-error 'make-string-template "(procedure-arity-includes/c 1)" insertion))
+  (unless (or (memq on-missing '(error empty))
+              (and (procedure? on-missing)
+                   (procedure-arity-includes? on-missing 1)))
+    (raise-argument-error 'make-string-template
+                          "(or/c 'error 'empty (procedure-arity-includes/c 1))"
+                          on-missing))
+  (unless (or (not expression-namespace)
+              (namespace? expression-namespace))
+    (raise-argument-error 'make-string-template "(or/c #f namespace?)" expression-namespace))
+  (unless (procedure? combiner)
+    (raise-argument-error 'make-string-template "procedure?" combiner))
+  (define expr-ns
+    (if expression-namespace
+        expression-namespace
+        (current-namespace)))
+  (template tmpl
+            (parse-string-template tmpl 'make-string-template)
+            insertion
+            on-missing
+            expr-ns
+            combiner))
+
+;; string-template-apply : string-template? [container] -> any/c
+;;   Render compiled template tpl with bindings.
+(define (string-template-apply tpl [bindings '()])
+  (unless (string-template? tpl)
+    (raise-argument-error 'string-template-apply "string-template?" tpl))
+  (unless (template-container? bindings)
+    (raise-argument-error 'string-template-apply "(or/c list? vector? hash? (listof pair?))" bindings))
+  (render-string-template 'string-template-apply
+                          (template-tokens tpl)
+                          bindings
+                          (template-insertion tpl)
+                          (template-on-missing tpl)
+                          (template-expression-namespace tpl)
+                          (template-combiner tpl)))
+
+;; string-template : string? [container]
+;;                   [#:insertion (-> any/c string?)]
+;;                   [#:missing (or/c 'error 'empty (-> string? any/c))]
+;;                   [#:expression-namespace (or/c #f namespace?)]
+;;                   -> string?
+;;   Fill backtick-delimited placeholders in tmpl from positional and named bindings.
+(define (string-template tmpl
+                         [bindings '()]
+                         #:insertion [insertion (λ (v) (format "~a" v))]
+                         #:missing [on-missing 'error]
+                         #:expression-namespace [expression-namespace #f])
+  (unless (string? tmpl)
+    (raise-argument-error 'string-template "string?" tmpl))
+  (unless (template-container? bindings)
+    (raise-argument-error 'string-template "(or/c list? vector? hash? (listof pair?))" bindings))
+  (unless (and (procedure? insertion)
+               (procedure-arity-includes? insertion 1))
+    (raise-argument-error 'string-template "(procedure-arity-includes/c 1)" insertion))
+  (unless (or (memq on-missing '(error empty))
+              (and (procedure? on-missing)
+                   (procedure-arity-includes? on-missing 1)))
+    (raise-argument-error 'string-template
+                          "(or/c 'error 'empty (procedure-arity-includes/c 1))"
+                          on-missing))
+  (unless (or (not expression-namespace)
+              (namespace? expression-namespace))
+    (raise-argument-error 'string-template "(or/c #f namespace?)" expression-namespace))
+  (define expr-ns
+    (if expression-namespace
+        expression-namespace
+        (current-namespace)))
+  (render-string-template 'string-template
+                          (parse-string-template tmpl 'string-template)
+                          bindings
+                          insertion
+                          on-missing
+                          expr-ns
+                          string-append))
 
 ;; string-reverse : string? -> string?
 ;;   Reverse characters in s.
@@ -2231,6 +2648,105 @@
   (check-equal? (string-repeat "ab" 3) "ababab")
   (check-exn exn:fail:contract? (λ () (string-repeat 123 2)))
   (check-exn exn:fail:contract? (λ () (string-repeat "ab" -1)))
+
+  ;; string-template
+  (check-equal? (string-template "Hello, `name`!" (hash 'name "Ada"))
+                "Hello, Ada!")
+  (check-equal? (string-template "sum: `` + `` = `2`" '(2 3 5))
+                "sum: 2 + 3 = 5")
+  (check-equal? (string-template "`name`: `count`"
+                                 '(("name" . "items") (count . 3)))
+                "items: 3")
+  (check-equal? (string-template "value: `0`" (vector 42))
+                "value: 42")
+  (check-equal? (string-template "missing=`x`" (hash) #:missing 'empty)
+                "missing=")
+  (check-equal? (string-template "custom=`x`" (hash) #:missing (λ (ph) (string-append "<" ph ">")))
+                "custom=<`x`>")
+  (check-equal? (string-template "\\`not-a-placeholder\\` + ``" '(7))
+                "`not-a-placeholder` + 7")
+  (check-equal? (string-template "`x`" (hash 'x "ab") #:insertion string-upcase)
+                "AB")
+  (check-equal? (string-template "`x`" (hash 'x #f))
+                "#f")
+  (define expr-ns-range (make-base-namespace))
+  (parameterize ([current-namespace expr-ns-range])
+    (namespace-require 'racket/list))
+  (check-equal? (string-template "Values: <* (range 1 6) *>" (hash)
+                                 #:expression-namespace expr-ns-range)
+                "Values: (1 2 3 4 5)")
+  (check-equal? (string-template "Value `a`: <* (range 1 (add1 n)) *>"
+                                 (hash 'a 1234 'n 3)
+                                 #:expression-namespace expr-ns-range)
+                "Value 1234: (1 2 3)")
+  (define expr-ns1 (make-base-namespace))
+  (parameterize ([current-namespace expr-ns1])
+    (namespace-set-variable-value! 'x 41 #t))
+  (check-equal? (parameterize ([current-namespace expr-ns1])
+                  (string-template "<* (+ x 1) *>" (hash)))
+                "42")
+  (define expr-ns2 (make-base-namespace))
+  (parameterize ([current-namespace expr-ns2])
+    (namespace-set-variable-value! 'x 50 #t))
+  (check-equal? (string-template "<* (+ x 1) *>" (hash) #:expression-namespace expr-ns2)
+                "51")
+  (check-exn exn:fail? (λ () (string-template "x=<* (range 1 3) 99 *>" (hash))))
+  (check-exn exn:fail? (λ () (string-template "x=<* (range 1 3)" (hash))))
+  (check-exn exn:fail? (λ () (string-template "`x")))
+  (check-exn exn:fail? (λ () (string-template "`a-b`" (hash))))
+  (check-exn exn:fail? (λ () (string-template "`0`" '())))
+  (check-exn exn:fail:contract? (λ () (string-template 123 '())))
+  (check-exn exn:fail:contract? (λ () (string-template "x" 123)))
+  (check-exn exn:fail:contract? (λ () (string-template "x" '() #:insertion 1)))
+  (check-exn exn:fail:contract? (λ () (string-template "x" '() #:missing 1)))
+  (check-exn exn:fail:contract? (λ () (string-template "x" '() #:expression-namespace 1)))
+
+  ;; make-string-template / string-template-apply
+  (define tpl1 (make-string-template "Hello, `name`!"))
+  (check-true (string-template? tpl1))
+  (check-equal? (format "~a" tpl1)
+                "#<string-template \"Hello, `name`!\">")
+  (check-equal? (string-template-apply tpl1 (hash 'name "Ada")) "Hello, Ada!")
+  (check-equal? (tpl1 (hash 'name "Ada")) "Hello, Ada!")
+
+  (define tpl2
+    (make-string-template "`` + `1` = `sum`"))
+  (check-equal? (string-template-apply tpl2 (hash 0 2 1 3 'sum 5))
+                "2 + 3 = 5")
+  (define tpl2b
+    (make-string-template "Values: <* (range 1 4) *>"
+                          #:expression-namespace expr-ns-range))
+  (check-equal? (string-template-apply tpl2b (hash))
+                "Values: (1 2 3)")
+
+  (define tpl3
+    (make-string-template "v=`x`"
+                          #:insertion (λ (v) v)
+                          #:combiner list))
+  (check-equal? (string-template-apply tpl3 (hash 'x 7))
+                '("v=" 7))
+
+  (define tpl4
+    (make-string-template "missing=`x`"
+                          #:missing (λ (ph) (string-append "<" ph ">"))))
+  (check-equal? (string-template-apply tpl4 (hash))
+                "missing=<`x`>")
+  (define expr-ns3 (make-base-namespace))
+  (parameterize ([current-namespace expr-ns3])
+    (namespace-set-variable-value! 'k 9 #t))
+  (define tpl5
+    (parameterize ([current-namespace expr-ns3])
+      (make-string-template "<* (+ k 1) *>")))
+  (check-equal? (string-template-apply tpl5 (hash))
+                "10")
+
+  (check-exn exn:fail:contract? (λ () (make-string-template 123)))
+  (check-exn exn:fail:contract? (λ () (make-string-template "x" #:insertion 1)))
+  (check-exn exn:fail:contract? (λ () (make-string-template "x" #:missing 1)))
+  (check-exn exn:fail:contract? (λ () (make-string-template "x" #:expression-namespace 1)))
+  (check-exn exn:fail:contract? (λ () (make-string-template "x" #:combiner 1)))
+  (check-exn exn:fail:contract? (λ () (string-template-apply 123 (hash))))
+  (check-exn exn:fail:contract? (λ () (string-template-apply tpl1 123)))
 
   ;; string-reverse
   (check-equal? (string-reverse "") "")

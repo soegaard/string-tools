@@ -12,7 +12,7 @@ Build docs with:
                      string-tools/char-set))
 
 @(define st-eval (make-base-eval))
-@(st-eval '(require string-tools))
+@(st-eval '(require racket/list string-tools))
 
 @title{String Tools}
 @author+email["Jens Axel Søgaard" "jensaxel@soegaard.net"]
@@ -156,7 +156,8 @@ Use this overview as a quick map from task to procedure family.
    (CRow "Transform"
          @elem{@racket[string-repeat] @racket[string-reverse] @racket[string-rot13]
                @racket[string-pluralize] @racket[string-singularize]
-               @racket[string-intersperse]})))
+               @racket[string-intersperse] @racket[string-template]
+               @racket[make-string-template] @racket[string-template-apply]})))
 
 @(CSection
   #:which 'right
@@ -1091,6 +1092,120 @@ Returns a string consisting of @racket[s] repeated @racket[n] times.
   #:eval st-eval
   (string-repeat "ab" 0)
   (string-repeat "ab" 3)
+]
+}
+
+@defproc[(string-template
+           [template string?]
+           [bindings (or/c list? vector? hash? (listof pair?)) null]
+           [#:insertion insertion (-> any/c string?) ~a]
+           [#:missing on-missing (or/c 'error 'empty (-> string? any/c)) 'error]
+           [#:expression-namespace expression-namespace (or/c #f namespace?) #f])
+         string?]{
+
+Fills placeholders in @racket[template] and returns the result string.
+
+Placeholders are enclosed in backticks:
+
+@itemlist[
+  @item{@literal{``} uses the next positional value (0-based).}
+  @item{@literal{`0`}, @literal{`1`}, and so on use explicit positional values.}
+  @item{@literal{`name`} uses a named value.}
+]
+
+Expression placeholders use @literal{<* ... *>}.
+The expression is read with @racket[read-syntax] and evaluated with
+@racket[eval-syntax] each time the template is rendered.
+Named bindings from hashes or association lists are available as variables
+inside the expression.
+When @racket[#:expression-namespace] is @racket[#f], the current namespace is
+used.
+
+For positional placeholders, @racket[bindings] can be a list or vector.
+For named placeholders, use a hash or association list. Named keys are matched
+as either strings or symbols.
+
+Use @racket[#:insertion] to control how values are converted to strings.
+Use @racket[#:missing] to choose missing-value behavior:
+@racket['error] raises an exception, @racket['empty] inserts the empty string,
+and a procedure receives the missing placeholder text.
+
+@examples[
+  #:eval st-eval
+  (string-template "Hello, `name`!" (hash 'name "Ada"))
+  (string-template "`` + `` = `2`" '(2 3 5))
+  (string-template "`name`: `count`" '(("name" . "items") (count . 3)))
+  (string-template "`` + `1` = `sum`"
+                   (hash 0 2 1 3 'sum 5))
+  (string-template "Values: <* (range 1 6) *>" (hash))
+  (string-template "Value `a`: <* (range 1 (add1 n)) *>"
+                   (hash 'a 1234 'n 3))
+  (string-template "`name`"
+                   (hash 'name "ada")
+                   #:insertion string-upcase)
+  (string-template "missing=`x`" (hash) #:missing 'empty)
+  (string-template "missing=`x`" (hash)
+                   #:missing (λ (ph) (string-append "<missing " ph ">")))
+]
+}
+
+@defproc[(make-string-template
+           [template string?]
+           [#:insertion insertion (-> any/c any/c) ~a]
+           [#:missing on-missing (or/c 'error 'empty (-> string? any/c)) 'error]
+           [#:expression-namespace expression-namespace (or/c #f namespace?) #f]
+           [#:combiner combiner (-> any/c ... any/c) string-append])
+         string-template?]{
+
+Compiles @racket[template] into a reusable template value.
+
+The resulting template stores parsed placeholders and rendering options.
+Use @racket[string-template-apply] to render it, or call it as a procedure.
+When @racket[#:expression-namespace] is @racket[#f], the current namespace is
+captured and stored for later rendering.
+Otherwise, @racket[expression-namespace] is used to evaluate template
+expressions.
+
+@examples[
+  #:eval st-eval
+  (define greeting-template
+    (make-string-template "Hello, `name`!"))
+  greeting-template
+  (string-template-apply greeting-template (hash 'name "Ada"))
+  (greeting-template (hash 'name "Ada"))
+
+  (define expr-ns (make-base-namespace))
+  (parameterize ([current-namespace expr-ns])
+    (namespace-require 'racket/list))
+  (define range-template
+    (make-string-template
+     "Values: <* (range 1 4) *>"
+     #:expression-namespace expr-ns))
+  (string-template-apply range-template (hash))
+]
+}
+
+@defproc[(string-template? [v any/c]) boolean?]{
+
+Returns @racket[#t] when @racket[v] is a compiled template value.
+}
+
+@defproc[(string-template-apply
+           [template string-template?]
+           [bindings (or/c list? vector? hash? (listof pair?)) null])
+         any/c]{
+
+Renders compiled template @racket[template] with @racket[bindings].
+
+The result is produced by the template's combiner.
+With the default combiner, the result is a string.
+
+@examples[
+  #:eval st-eval
+  (define tpl
+    (make-string-template "`` + `1` = `sum`"))
+  (string-template-apply tpl (hash 0 2 1 3 'sum 5))
+  (tpl (hash 0 2 1 3 'sum 5))
 ]
 }
 
